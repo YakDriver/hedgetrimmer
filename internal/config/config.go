@@ -149,9 +149,8 @@ func (c *Config) finish() error {
 		return fmt.Errorf("stale_days must be positive, got %d", c.StaleDays)
 	}
 	if c.Repo != "" {
-		owner, name, ok := strings.Cut(c.Repo, "/")
-		if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
-			return fmt.Errorf("repo must be \"owner/name\", got %q", c.Repo)
+		if err := CheckRepo(c.Repo); err != nil {
+			return err
 		}
 	}
 	if c.Collapse == nil {
@@ -187,6 +186,15 @@ func (c *Config) finish() error {
 
 	c.BotEmails = append([]string{defaultBotMark}, c.BotEmails...)
 	c.BotLogins = append([]string{defaultBotMark}, c.BotLogins...)
+	return nil
+}
+
+// CheckRepo reports whether repo has the form "owner/name".
+func CheckRepo(repo string) error {
+	owner, name, ok := strings.Cut(repo, "/")
+	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+		return fmt.Errorf("repo must be \"owner/name\", got %q", repo)
+	}
 	return nil
 }
 

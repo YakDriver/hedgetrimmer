@@ -118,6 +118,7 @@ collapse = ["R6", "releases"]
 func TestLoad_invalid(t *testing.T) {
 	tests := map[string]struct{ body, wantErr string }{
 		"bad repo":         {`repo = "widgets"`, "owner/name"},
+		"repo extra slash": {`repo = "acme/widgets/extra"`, "owner/name"},
 		"negative stale":   {`stale_days = -1`, "stale_days"},
 		"bad regex":        {`protect "x" { patterns = ["("] }`, `protect "x"`},
 		"empty patterns":   {`protect "x" { patterns = [] }`, "patterns is empty"},
@@ -171,5 +172,16 @@ func TestTemplate_decodes(t *testing.T) {
 	}
 	if len(c.Protect) != 2 || c.MaintainersMarkdown == nil {
 		t.Errorf("template missing examples: %+v", c)
+	}
+}
+
+func TestCheckRepo(t *testing.T) {
+	for repo, ok := range map[string]bool{
+		"acme/widgets": true, "acme/2026": true, "acme/true": true,
+		"widgets": false, "/widgets": false, "acme/": false, "acme/widgets/extra": false,
+	} {
+		if err := CheckRepo(repo); (err == nil) != ok {
+			t.Errorf("CheckRepo(%q) = %v, want ok=%v", repo, err, ok)
+		}
 	}
 }

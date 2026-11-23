@@ -76,7 +76,7 @@ func Run(ctx context.Context, cfg *config.Config, roster map[string]bool, now ti
 		}
 	}
 
-	base, refs, err := fetchRefs(ctx, repo)
+	base, baseSHA, refs, err := fetchRefs(ctx, repo)
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +89,7 @@ func Run(ctx context.Context, cfg *config.Config, roster map[string]bool, now ti
 		branches = append(branches, r.branch(cfg, roster, now))
 	}
 
-	if err := markInBase(ctx, cfg.Remote, base, branches); err != nil {
+	if err := markInBase(ctx, cfg.Remote, baseSHA, branches); err != nil {
 		return nil, err
 	}
 	for i := range branches {
@@ -170,9 +170,14 @@ type (
 	ref struct {
 		Name   string `json:"name"`
 		Target commit `json:"target"`
-		PRs    struct {
+		// OpenPRs and RecentPRs are aliases of associatedPullRequests. Open
+		// PRs are queried separately so many newer closed PRs can't hide one.
+		OpenPRs struct {
 			Nodes []prNode `json:"nodes"`
-		} `json:"associatedPullRequests"`
+		} `json:"openPRs"`
+		RecentPRs struct {
+			Nodes []prNode `json:"nodes"`
+		} `json:"recentPRs"`
 	}
 	prNode struct {
 		Number int    `json:"number"`
@@ -196,7 +201,10 @@ type (
 		Data struct {
 			Repository *struct {
 				DefaultBranchRef *struct {
-					Name string `json:"name"`
+					Name   string `json:"name"`
+					Target struct {
+						OID string `json:"oid"`
+					} `json:"target"`
 				} `json:"defaultBranchRef"`
 				Refs struct {
 					PageInfo struct {
@@ -222,16 +230,18 @@ func (r ref) branch(cfg *config.Config, roster map[string]bool, now time.Time) B
 	return b
 }
 
-// pr returns the open PR if there is one, otherwise the highest-numbered.
-// GitHub's CREATED_AT order doesn't reliably match PR numbers.
+// pr returns the open PR if there is one, otherwise the highest-numbered of
+// the most recently created. PR numbers are assigned at creation, but
+// GitHub's CREATED_AT order doesn't break ties by number.
 func (r ref) pr() *PR {
-	nodes := r.PRs.Nodes
+	nodes := r.OpenPRs.Nodes
+	if len(nodes) == 0 {
+		nodes = r.RecentPRs.Nodes
+	}
 	if len(nodes) == 0 {
 		return nil
 	}
-	n := slices.MaxFunc(nodes, func(a, b prNode) int {
-		return cmp.Or(cmp.Compare(boolInt(a.State == "OPEN"), boolInt(b.State == "OPEN")), cmp.Compare(a.Number, b.Number))
-	})
+	n := slices.MaxFunc(nodes, func(a, b prNode) int { return cmp.Compare(a.Number, b.Number) })
 	p := &PR{Number: n.Number, State: n.State}
 	if n.Author != nil {
 		p.Author = n.Author.Login
@@ -242,16 +252,9 @@ func (r ref) pr() *PR {
 	return p
 }
 
-func boolInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
-}
-
 const refsQuery = `query($owner: String!, $name: String!, $cursor: String) {
   repository(owner: $owner, name: $name) {
-    defaultBranchRef { name }
+    defaultBranchRef { name target { oid } }
     refs(refPrefix: "refs/heads/", first: 100, after: $cursor) {
       pageInfo { hasNextPage endCursor }
       nodes {
@@ -263,7 +266,10 @@ const refsQuery = `query($owner: String!, $name: String!, $cursor: String) {
             author { email user { login } }
           }
         }
-        associatedPullRequests(first: 10, orderBy: {field: CREATED_AT, direction: DESC}) {
+        openPRs: associatedPullRequests(first: 10, states: [OPEN]) {
+          nodes { number state author { login __typename } }
+        }
+        recentPRs: associatedPullRequests(first: 10, orderBy: {field: CREATED_AT, direction: DESC}) {
           nodes { number state author { login __typename } }
         }
       }
@@ -272,26 +278,23 @@ const refsQuery = `query($owner: String!, $name: String!, $cursor: String) {
 }`
 
 // fetchRefs lists every branch with one paginated GraphQL query instead of
-// one "gh pr list" call per branch.
-func fetchRefs(ctx context.Context, repo string) (base string, refs []ref, err error) {
+// one "gh pr list" call per branch. It also returns the default branch's name
+// and tip, which is the baseline for markInBase.
+func fetchRefs(ctx context.Context, repo string) (base, baseSHA string, refs []ref, err error) {
 	owner, name, _ := strings.Cut(repo, "/")
 	cursor := ""
 	for {
-		args := []string{"api", "graphql", "-f", "query=" + refsQuery, "-F", "owner=" + owner, "-F", "name=" + name}
-		if cursor != "" {
-			args = append(args, "-F", "cursor="+cursor)
-		}
-		out, err := run(ctx, "gh", args...)
+		out, err := run(ctx, "gh", refsArgs(owner, name, cursor)...)
 		if err != nil {
-			return "", nil, err
+			return "", "", nil, err
 		}
 		page, err := parseRefsPage(out)
 		if err != nil {
-			return "", nil, fmt.Errorf("repository %s: %w", repo, err)
+			return "", "", nil, fmt.Errorf("repository %s: %w", repo, err)
 		}
 		r := page.Data.Repository
 		if r.DefaultBranchRef != nil {
-			base = r.DefaultBranchRef.Name
+			base, baseSHA = r.DefaultBranchRef.Name, r.DefaultBranchRef.Target.OID
 		}
 		refs = append(refs, r.Refs.Nodes...)
 		if !r.Refs.PageInfo.HasNextPage {
@@ -299,10 +302,20 @@ func fetchRefs(ctx context.Context, repo string) (base string, refs []ref, err e
 		}
 		cursor = r.Refs.PageInfo.EndCursor
 	}
-	if base == "" {
-		return "", nil, fmt.Errorf("repository %s has no default branch", repo)
+	if base == "" || baseSHA == "" {
+		return "", "", nil, fmt.Errorf("repository %s has no default branch", repo)
 	}
-	return base, refs, nil
+	return base, baseSHA, refs, nil
+}
+
+// refsArgs uses -f, not -F, for every variable: -F converts values like
+// "true", "null", or "2026" to non-strings, which valid repo names can be.
+func refsArgs(owner, name, cursor string) []string {
+	args := []string{"api", "graphql", "-f", "query=" + refsQuery, "-f", "owner=" + owner, "-f", "name=" + name}
+	if cursor != "" {
+		args = append(args, "-f", "cursor="+cursor)
+	}
+	return args
 }
 
 func parseRefsPage(data []byte) (*refsPage, error) {
@@ -317,27 +330,30 @@ func parseRefsPage(data []byte) (*refsPage, error) {
 }
 
 // markInBase sets InBase for branches whose every commit is patch-equivalent
-// to one in the default branch (git cherry), which also catches squash- and
-// rebase-merged work. It needs the tip commits locally, so it checks for
-// them first and asks for a fetch rather than misreporting.
-func markInBase(ctx context.Context, remote, base string, branches []Branch) error {
-	baseRef := remote + "/" + base
-	if _, err := run(ctx, "git", "rev-parse", "--verify", "--quiet", baseRef+"^{commit}"); err != nil {
-		return fmt.Errorf("%s not found locally; run \"git fetch %s\"", baseRef, remote)
-	}
-
-	var shas strings.Builder
+// to one reachable from baseSHA (git cherry), which also catches rebase-merged
+// and cherry-picked work. baseSHA is the audited repository's default branch
+// tip from GitHub, not a local remote-tracking ref, which could belong to a
+// fork or be out of date.
+//
+// git cherry skips merge commits, and a merge can carry its own changes in
+// conflict resolutions, so a branch with merges not reachable from baseSHA is
+// never marked InBase.
+//
+// It needs the commits locally, so it checks for them first and asks for a
+// fetch rather than misreporting.
+func markInBase(ctx context.Context, remote, baseSHA string, branches []Branch) error {
+	shas := []string{baseSHA}
 	for _, b := range branches {
-		shas.WriteString(b.SHA + "\n")
+		shas = append(shas, b.SHA)
 	}
 	cmd := exec.CommandContext(ctx, "git", "cat-file", "--batch-check")
-	cmd.Stdin = strings.NewReader(shas.String())
+	cmd.Stdin = strings.NewReader(strings.Join(shas, "\n") + "\n")
 	out, err := cmd.Output()
 	if err != nil {
 		return fmt.Errorf("git cat-file: %w", err)
 	}
 	if missing := bytes.Count(out, []byte(" missing\n")); missing > 0 {
-		return fmt.Errorf("%d branch tips aren't in the local clone; run \"git fetch %s\"", missing, remote)
+		return fmt.Errorf("%d commits (default branch or branch tips) aren't in the local clone; fetch the audited repository, e.g. \"git fetch %s\"", missing, remote)
 	}
 
 	var (
@@ -350,7 +366,7 @@ func markInBase(ctx context.Context, remote, base string, branches []Branch) err
 		wg.Go(func() {
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			out, err := run(ctx, "git", "cherry", baseRef, branches[i].SHA)
+			inBase, err := branchInBase(ctx, baseSHA, branches[i].SHA)
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
@@ -359,11 +375,26 @@ func markInBase(ctx context.Context, remote, base string, branches []Branch) err
 				mu.Unlock()
 				return
 			}
-			branches[i].InBase = allInBase(string(out))
+			branches[i].InBase = inBase
 		})
 	}
 	wg.Wait()
 	return firstErr
+}
+
+func branchInBase(ctx context.Context, baseSHA, tip string) (bool, error) {
+	merges, err := run(ctx, "git", "rev-list", "--count", "--merges", baseSHA+".."+tip)
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(string(merges)) != "0" {
+		return false, nil
+	}
+	cherry, err := run(ctx, "git", "cherry", baseSHA, tip)
+	if err != nil {
+		return false, err
+	}
+	return allInBase(string(cherry)), nil
 }
 
 // allInBase reports whether git cherry output has no "+" lines, which mark

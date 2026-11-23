@@ -6,7 +6,9 @@ package audit
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -110,32 +112,37 @@ func TestClassify(t *testing.T) {
 
 func TestParseRefsPage(t *testing.T) {
 	data := []byte(`{"data":{"repository":{
-	  "defaultBranchRef":{"name":"main"},
+	  "defaultBranchRef":{"name":"main","target":{"oid":"base1"}},
 	  "refs":{"pageInfo":{"hasNextPage":true,"endCursor":"abc"},"nodes":[
-	    {"name":"f-x","target":{"oid":"1111","committedDate":"2026-11-01T00:00:00Z",
+	    {"name":"open-behind-closed","target":{"oid":"1111","committedDate":"2026-11-01T00:00:00Z",
 	      "author":{"email":"g@example.com","user":{"login":"gdavison"}}},
-	     "associatedPullRequests":{"nodes":[
-	       {"number":9,"state":"CLOSED","author":{"login":"gdavison","__typename":"User"}},
-	       {"number":5,"state":"OPEN","author":{"login":"copilot-swe-agent","__typename":"Bot"}}]}},
+	     "openPRs":{"nodes":[{"number":5,"state":"OPEN","author":{"login":"copilot-swe-agent","__typename":"Bot"}}]},
+	     "recentPRs":{"nodes":[
+	       {"number":19,"state":"CLOSED","author":{"login":"gdavison","__typename":"User"}},
+	       {"number":18,"state":"CLOSED","author":{"login":"gdavison","__typename":"User"}}]}},
 	    {"name":"two-closed","target":{"oid":"3333","committedDate":"2026-01-01T00:00:00Z","author":{"email":""}},
-	     "associatedPullRequests":{"nodes":[
+	     "openPRs":{"nodes":[]},
+	     "recentPRs":{"nodes":[
 	       {"number":49078,"state":"MERGED","author":null},
 	       {"number":49079,"state":"CLOSED","author":null}]}},
 	    {"name":"no-pr","target":{"oid":"2222","committedDate":"2026-01-01T00:00:00Z",
 	      "author":{"email":"x@example.com","user":null}},
-	     "associatedPullRequests":{"nodes":[]}}]}}}}`)
+	     "openPRs":{"nodes":[]},"recentPRs":{"nodes":[]}}]}}}}`)
 	page, err := parseRefsPage(data)
 	if err != nil {
 		t.Fatal(err)
 	}
 	r := page.Data.Repository
-	if r.DefaultBranchRef.Name != "main" || !r.Refs.PageInfo.HasNextPage || r.Refs.PageInfo.EndCursor != "abc" || len(r.Refs.Nodes) != 3 {
+	if r.DefaultBranchRef.Name != "main" || r.DefaultBranchRef.Target.OID != "base1" ||
+		!r.Refs.PageInfo.HasNextPage || r.Refs.PageInfo.EndCursor != "abc" || len(r.Refs.Nodes) != 3 {
 		t.Fatalf("unexpected page: %+v", r)
 	}
 
+	// An open PR wins even when the recent list (capped at 10) doesn't
+	// include it.
 	pr := r.Refs.Nodes[0].pr()
-	if pr.Number != 5 || !pr.Bot || pr.Author != "app/copilot-swe-agent" {
-		t.Errorf("open PR should win over newer closed one, got %+v", pr)
+	if pr.Number != 5 || pr.State != "OPEN" || !pr.Bot || pr.Author != "app/copilot-swe-agent" {
+		t.Errorf("want open PR #5, got %+v", pr)
 	}
 	if pr := r.Refs.Nodes[1].pr(); pr.Number != 49079 || pr.Author != "" {
 		t.Errorf("want highest-numbered PR with no author, got %+v", pr)
@@ -152,6 +159,101 @@ func TestParseRefsPage(t *testing.T) {
 
 	if _, err := parseRefsPage([]byte(`{"data":{"repository":null}}`)); err == nil {
 		t.Error("want error for inaccessible repo")
+	}
+}
+
+func TestRefsArgs_rawStrings(t *testing.T) {
+	args := refsArgs("2026", "true", "null")
+	for i, a := range args {
+		if a == "-F" {
+			t.Errorf("args[%d] is -F, which type-converts values: %q", i, args)
+		}
+	}
+	for _, want := range []string{"owner=2026", "name=true", "cursor=null"} {
+		if i := slices.Index(args, want); i < 1 || args[i-1] != "-f" {
+			t.Errorf("%q not passed with -f: %q", want, args)
+		}
+	}
+}
+
+func git(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com",
+		"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func commitFile(t *testing.T, dir, name, body string) string {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "add", name)
+	git(t, dir, "commit", "-q", "-m", name)
+	return git(t, dir, "rev-parse", "HEAD")
+}
+
+func TestBranchInBase(t *testing.T) {
+	dir := t.TempDir()
+	git(t, dir, "init", "-q", "-b", "main")
+	commitFile(t, dir, "a", "a")
+
+	// "picked" holds one commit that main later cherry-picks.
+	git(t, dir, "switch", "-q", "-c", "picked")
+	picked := commitFile(t, dir, "b", "b")
+	git(t, dir, "switch", "-q", "main")
+	git(t, dir, "cherry-pick", picked)
+
+	// "unique" has a commit main lacks.
+	git(t, dir, "switch", "-q", "-c", "unique")
+	unique := commitFile(t, dir, "c", "c")
+
+	// "merged" is an evil merge: its only ordinary commit is upstream, but
+	// merging main into it also adds a file that exists nowhere else.
+	git(t, dir, "switch", "-q", "main")
+	commitFile(t, dir, "d", "d")
+	git(t, dir, "switch", "-q", "-c", "merged", picked)
+	git(t, dir, "merge", "-q", "--no-commit", "--no-ff", "main")
+	if err := os.WriteFile(filepath.Join(dir, "evil"), []byte("only here"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "add", "evil")
+	git(t, dir, "commit", "-q", "--no-edit")
+	merged := git(t, dir, "rev-parse", "HEAD")
+	if out := git(t, dir, "cherry", "main", merged); strings.Contains(out, "+") {
+		t.Fatalf("setup: every ordinary commit should be upstream, got %q", out)
+	}
+
+	git(t, dir, "switch", "-q", "main")
+	base := git(t, dir, "rev-parse", "HEAD")
+	t.Chdir(dir)
+
+	for name, tc := range map[string]struct {
+		tip  string
+		want bool
+	}{
+		"cherry-picked":     {picked, true},
+		"ancestor":          {git(t, dir, "rev-parse", "HEAD~1"), true},
+		"unique commit":     {unique, false},
+		"unreachable merge": {merged, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := branchInBase(t.Context(), base, tc.tip)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("branchInBase = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

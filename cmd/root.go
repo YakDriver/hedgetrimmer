@@ -10,7 +10,6 @@ import (
 	"os"
 	"runtime/debug"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/YakDriver/hedgetrimmer/internal/audit"
@@ -78,8 +77,8 @@ func runAudit(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	if repo != "" {
-		if o, n, ok := strings.Cut(repo, "/"); !ok || o == "" || n == "" {
-			return fmt.Errorf(`--repo must be "owner/name", got %q`, repo)
+		if err := config.CheckRepo(repo); err != nil {
+			return fmt.Errorf("--repo: %w", err)
 		}
 		cfg.Repo = repo
 	}
